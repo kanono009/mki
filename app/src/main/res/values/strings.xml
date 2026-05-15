@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Floating Quiz Clicker</string>
+    <string name="accessibility_service_description">Allows Floating Quiz Clicker to perform user-triggered taps at the visible floating button position.</string>
+</resources>
