@@ -9,11 +9,8 @@ import android.content.Intent
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
-import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
-import android.os.Process
-import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
@@ -27,11 +24,14 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import com.example.floatingquizclicker.accessibility.TapAccessibilityService
+import com.example.floatingquizclicker.timing.PrecisionClicker
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.util.Random
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -45,23 +45,20 @@ class FloatingOverlayService : Service() {
     private lateinit var delayInput: EditText
     private lateinit var statusText: TextView
     private lateinit var antiDetectCheckbox: CheckBox
+    private lateinit var samsungOffsetInput: EditText
+    private lateinit var calibrationButton: Button
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private lateinit var timingThread: HandlerThread
-    private lateinit var timingHandler: Handler
-    private val countdownToken = Any()
+    private lateinit var precisionClicker: PrecisionClicker
+    private val calibrationLaps = AtomicInteger(0)
+    private val calibrationTotalOffsetNanos = AtomicLong(0L)
+    private var calibrationTargetTimeNanos = 0L
     private val random = Random()
 
     private var isPanelVisible = true
 
-    @Volatile private var countdownRunning = false
-    @Volatile private var isCalibrating = false
-
-    // ── Precision timing (nanoTime-based) ────────────────────────────────────
-    // Subtract from interval to centre click on target (tune via CALIBRATE)
-    @Volatile private var systemLatencyNanos = 45_000_000L   // default 45 ms
-    // Anchor for drift-free scheduling: next = prev + interval, never now + interval
-    @Volatile private var nextTargetNanos = 0L
+    @Volatile
+    private var countdownRunning = false
 
     private var buttonSize = 58 // Default size in dp
     private lateinit var scaleDetector: ScaleGestureDetector
@@ -69,9 +66,21 @@ class FloatingOverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        timingThread = HandlerThread("PrecisionClicker", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
-        timingHandler = Handler(timingThread.looper)
         startForeground(NOTIFICATION_ID, buildNotification())
+        
+        precisionClicker = PrecisionClicker(::performTapAtCurrentButtonCenter) { actualTimeNanos ->
+            if (countdownRunning && calibrationLaps.get() > 0) {
+                val offsetNanos = actualTimeNanos - calibrationTargetTimeNanos
+                calibrationTotalOffsetNanos.addAndGet(offsetNanos)
+                
+                mainHandler.postDelayed({
+                    val delayMs = parseDelayMillis(delayInput.text?.toString().orEmpty()) ?: 0L
+                    performCalibrationLap(delayMs.toFloat())
+                }, 100)
+            }
+        }
+        precisionClicker.start()
+        
         createFloatingButton()
         createPanel()
     }
@@ -81,9 +90,7 @@ class FloatingOverlayService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
-        mainHandler.removeCallbacksAndMessages(countdownToken)
-        if (::timingHandler.isInitialized) timingHandler.removeCallbacksAndMessages(countdownToken)
-        if (::timingThread.isInitialized) timingThread.quitSafely()
+        precisionClicker.stop()
         runCatching { windowManager.removeView(floatingButton) }
         runCatching { windowManager.removeView(panel) }
         super.onDestroy()
@@ -144,6 +151,39 @@ class FloatingOverlayService : Service() {
         }
         panel.addView(title, LinearLayout.LayoutParams(-1, -2))
 
+        val samsungOffsetLabel = TextView(this).apply {
+            text = "Samsung Offset (ms):"
+            textSize = 12f
+            setTextColor(0xFFE5E7EB.toInt())
+            setPadding(0, dp(8), 0, 0)
+        }
+        panel.addView(samsungOffsetLabel, LinearLayout.LayoutParams(-1, -2))
+
+        samsungOffsetInput = EditText(this).apply {
+            hint = "e.g. 45 (default)"
+            setText("45")
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+            textSize = 15f
+            setTextColor(0xFFFFFFFF.toInt())
+            setHintTextColor(0xFFCBD5E1.toInt())
+            setOnTouchListener { view, event ->
+                if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                    enablePanelInputMode()
+                    view.requestFocus()
+                    showKeyboard(view)
+                }
+                false
+            }
+            setOnFocusChangeListener { view, hasFocus ->
+                if (hasFocus) {
+                    enablePanelInputMode()
+                    showKeyboard(view)
+                }
+            }
+        }
+        panel.addView(samsungOffsetInput, LinearLayout.LayoutParams(-1, dp(52)))
+
         delayInput = EditText(this).apply {
             hint = "Delay seconds, e.g. 21.000"
             setText("21.000")
@@ -178,9 +218,15 @@ class FloatingOverlayService : Service() {
         }
         panel.addView(antiDetectCheckbox, LinearLayout.LayoutParams(-1, -2))
 
+        calibrationButton = Button(this).apply {
+            text = "Start 10-Lap Calibration"
+            setOnClickListener { startCalibration() }
+        }
+        panel.addView(calibrationButton, LinearLayout.LayoutParams(-1, dp(48)))
+
         val startButton = Button(this).apply {
             text = "START COUNTDOWN"
-            setOnClickListener { startCountdownFromPanel() }
+            setOnClickListener { startPrecisionCountdown() }
         }
         panel.addView(startButton, LinearLayout.LayoutParams(-1, dp(48)))
 
@@ -189,12 +235,6 @@ class FloatingOverlayService : Service() {
             setOnClickListener { cancelCountdown("Countdown cancelled.") }
         }
         panel.addView(stopButton, LinearLayout.LayoutParams(-1, dp(44)))
-
-        val calibrateButton = Button(this).apply {
-            text = "CALIBRATE (10 laps)"
-            setOnClickListener { startCalibration() }
-        }
-        panel.addView(calibrateButton, LinearLayout.LayoutParams(-1, dp(44)))
 
         statusText = TextView(this).apply {
             text = "Drag TAP over target. Set delay. Press START COUNTDOWN. Pinch TAP to resize."
@@ -221,7 +261,7 @@ class FloatingOverlayService : Service() {
         windowManager.addView(panel, panelParams)
     }
 
-    private fun startCountdownFromPanel() {
+    private fun startPrecisionCountdown() {
         hideKeyboardAndRestorePassivePanel()
 
         if (!TapAccessibilityService.isReady()) {
@@ -236,88 +276,16 @@ class FloatingOverlayService : Service() {
             return
         }
 
-        mainHandler.removeCallbacksAndMessages(countdownToken)
-        timingHandler.removeCallbacksAndMessages(countdownToken)
+        val offsetText = samsungOffsetInput.text?.toString().orEmpty()
+        val offsetMs = (offsetText.toLongOrNull() ?: 45L)
+        precisionClicker.systemLatencyNanos = offsetMs * 1_000_000L
+
         countdownRunning = true
-
-        // Anchor: set first target using nanoTime, then every subsequent tap uses += interval
-        val intervalNanos = delayMs * 1_000_000L
-        nextTargetNanos = System.nanoTime() + intervalNanos
         statusText.text = "Running: immediate tap now; second tap scheduled at +${formatDelay(delayMs)} s. Button stays draggable."
-
-        performTapAtCurrentButtonCenter("Immediate tap")
-        scheduleDelayedTap(intervalNanos)
+        precisionClicker.scheduleTap(delayMs.toFloat())
     }
 
-    private fun scheduleDelayedTap(intervalNanos: Long) {
-        val runnable = Runnable {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
-
-            val fireAt = nextTargetNanos - systemLatencyNanos
-
-            // Pure spin — no sleep, no yield, nothing else
-            while (countdownRunning && System.nanoTime() < fireAt) { }
-
-            if (!countdownRunning) return@Runnable
-
-            performTapAtCurrentButtonCenter("Delayed tap")
-            countdownRunning = false
-            mainHandler.post { statusText.text = "Tap fired." }
-        }
-
-        timingHandler.post(runnable)
-    }
-
-    /**
-     * 10-lap calibration with systemLatencyNanos = 0.
-     * Measures raw offset between scheduled and actual nanoTime fire.
-     * Sets systemLatencyNanos to the average so real taps land centred on target.
-     */
-    private fun startCalibration() {
-        if (isCalibrating) { toast("Calibration already running."); return }
-        isCalibrating = true
-        val savedLatency = systemLatencyNanos
-        systemLatencyNanos = 0L   // raw measurement mode
-        statusText.text = "Calibrating... 10 laps (latency=0)"
-
-        timingHandler.post {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
-            val intervalNanos = 2_000_000_000L   // 2-second laps
-            val offsets = mutableListOf<Long>()
-
-            var lapTarget = System.nanoTime() + intervalNanos
-
-            repeat(10) { i ->
-                // Hybrid wait
-                var rem = lapTarget - System.nanoTime()
-                while (rem > 3_000_000L) { Thread.sleep(1L); rem = lapTarget - System.nanoTime() }
-                while (System.nanoTime() < lapTarget) { Thread.yield() }
-
-                val actual = System.nanoTime()
-                val offset = actual - lapTarget   // positive = fired late
-                offsets.add(offset)
-
-                val offsetMs = "%.2f".format(offset / 1_000_000.0)
-                mainHandler.post { statusText.text = "Lap ${i + 1}/10  offset=${offsetMs}ms" }
-
-                // Drift-free: next lap = prev lap + interval
-                lapTarget += intervalNanos
-                Thread.sleep(100L)   // brief pause between laps
-            }
-
-            val avgNanos = offsets.map { it }.average().toLong()
-            systemLatencyNanos = avgNanos.coerceAtLeast(0L)
-            isCalibrating = false
-
-            val avgMs = "%.2f".format(avgNanos / 1_000_000.0)
-            mainHandler.post {
-                statusText.text = "Calibration done. avg offset=${avgMs}ms → systemLatency=${systemLatencyNanos / 1_000_000L}ms"
-                toast("Calibrated! Latency set to ${systemLatencyNanos / 1_000_000L}ms")
-            }
-        }
-    }
-
-    private fun performTapAtCurrentButtonCenter(label: String) {
+    private fun performTapAtCurrentButtonCenter(label: String, onComplete: ((Boolean) -> Unit)? = null) {
         var centerX = buttonParams.x + buttonParams.width / 2f
         var centerY = buttonParams.y + buttonParams.height / 2f
         var duration = TAP_DURATION_MS
@@ -334,12 +302,14 @@ class FloatingOverlayService : Service() {
         setButtonPassThrough(true)
         val dispatched = TapAccessibilityService.performTap(centerX, centerY, durationMs = duration) { success ->
             mainHandler.postDelayed({ setButtonPassThrough(false) }, BUTTON_RESTORE_DELAY_MS)
+            onComplete?.invoke(success)
             if (!success) {
                 mainHandler.post { statusText.text = "$label failed or was cancelled by the system." }
             }
         }
         if (!dispatched) {
             setButtonPassThrough(false)
+            onComplete?.invoke(false)
             mainHandler.post { statusText.text = "$label could not be dispatched. Check Accessibility permission." }
         }
     }
@@ -368,10 +338,68 @@ class FloatingOverlayService : Service() {
     }
 
     private fun cancelCountdown(message: String) {
-        mainHandler.removeCallbacksAndMessages(countdownToken)
-        timingHandler.removeCallbacksAndMessages(countdownToken)
         countdownRunning = false
+        precisionClicker.stop()
+        precisionClicker.start() // Restart to clear any pending tasks
         statusText.text = message
+        calibrationLaps.set(0)
+        calibrationTotalOffsetNanos.set(0L)
+    }
+
+    private fun startCalibration() {
+        hideKeyboardAndRestorePassivePanel()
+
+        if (!TapAccessibilityService.isReady()) {
+            toast("Enable the accessibility tap service first.")
+            statusText.text = "Accessibility service is not enabled."
+            return
+        }
+
+        val delayMs = parseDelayMillis(delayInput.text?.toString().orEmpty())
+        if (delayMs == null || delayMs < 100) {
+            toast("Calibration delay must be at least 0.100 seconds.")
+            return
+        }
+
+        calibrationLaps.set(0)
+        calibrationTotalOffsetNanos.set(0L)
+        precisionClicker.systemLatencyNanos = 0L // Temporarily set to 0 for calibration
+        countdownRunning = true
+        statusText.text = "Starting 10-lap calibration for ${formatDelay(delayMs)}s interval..."
+
+        performCalibrationLap(delayMs.toFloat())
+    }
+
+    private fun performCalibrationLap(intervalMs: Float) {
+        if (!countdownRunning) return
+        
+        if (calibrationLaps.get() >= 10) {
+            finishCalibration()
+            return
+        }
+
+        val currentLap = calibrationLaps.incrementAndGet()
+        statusText.text = "Calibration Lap $currentLap/10: Waiting for first tap..."
+
+        val intervalNanos = (intervalMs * 1_000_000).toLong()
+        calibrationTargetTimeNanos = System.nanoTime() + intervalNanos
+        
+        precisionClicker.scheduleTap(intervalMs, isCalibration = true)
+    }
+
+    private fun finishCalibration() {
+        countdownRunning = false
+        val avgOffsetNanos = if (calibrationLaps.get() > 0) calibrationTotalOffsetNanos.get() / calibrationLaps.get() else 0L
+        val avgOffsetMs = avgOffsetNanos / 1_000_000.0
+        
+        // Update the UI with the calculated offset
+        mainHandler.post {
+            samsungOffsetInput.setText(String.format("%.0f", avgOffsetMs))
+            statusText.text = "Calibration complete. Average offset: %.3f ms. Set Samsung Offset to this value.".format(avgOffsetMs)
+            toast("Calibration finished. Average offset: %.3f ms.".format(avgOffsetMs))
+        }
+        
+        precisionClicker.systemLatencyNanos = (avgOffsetMs * 1_000_000).toLong()
     }
 
     private fun togglePanel() {
@@ -500,7 +528,9 @@ class FloatingOverlayService : Service() {
         private var dragging = false
 
         override fun onTouch(view: View, event: MotionEvent): Boolean {
-            if (delayInput.hasFocus()) return false
+            if (delayInput.hasFocus()) {
+                return false
+            }
 
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
@@ -533,7 +563,7 @@ class FloatingOverlayService : Service() {
     companion object {
         private const val CHANNEL_ID = "floating_quiz_clicker_overlay"
         private const val NOTIFICATION_ID = 2401
-        private const val TAP_DURATION_MS = 10L
+        private const val TAP_DURATION_MS = 10L // Ensure this is <= 50ms
         private const val BUTTON_RESTORE_DELAY_MS = 20L
     }
 }
