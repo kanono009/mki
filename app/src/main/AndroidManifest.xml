@@ -5,14 +5,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!--
-        USE_EXACT_ALARM (API 33+): grants exact-alarm capability automatically,
-        no user prompt needed. Falls back to setExact() on older APIs.
-        Required so AlarmManager.setExactAndAllowWhileIdle() can wake the CPU
-        during Doze for the precision tap timer.
-    -->
-    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
-    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
     <application
         android:allowBackup="true"
