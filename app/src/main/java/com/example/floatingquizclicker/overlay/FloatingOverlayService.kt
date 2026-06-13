@@ -249,38 +249,20 @@ class FloatingOverlayService : Service() {
         scheduleDelayedTap(intervalNanos)
     }
 
-    /**
-     * Precision scheduler using System.nanoTime() exclusively.
-     * - Drift-free: next target = prev target + interval (never now + interval)
-     * - Hybrid wait: Thread.sleep(1) while >3ms remaining, then yield-spin for final 3ms
-     * - systemLatencyNanos subtracted so click lands centred on target, not early
-     */
     private fun scheduleDelayedTap(intervalNanos: Long) {
         val runnable = Runnable {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
 
-            // Drift-free anchor: += interval, never = now + interval
             val fireAt = nextTargetNanos - systemLatencyNanos
 
-            // Hybrid wait ── coarse sleep while >3ms away
-            var remaining = fireAt - System.nanoTime()
-            while (remaining > 3_000_000L) {
-                Thread.sleep(1L)
-                remaining = fireAt - System.nanoTime()
-            }
-
-            // Fine spin for final 3ms ── yield to avoid burning a full core solid
-            while (countdownRunning && System.nanoTime() < fireAt) {
-                Thread.yield()
-            }
+            // Pure spin — no sleep, no yield, nothing else
+            while (countdownRunning && System.nanoTime() < fireAt) { }
 
             if (!countdownRunning) return@Runnable
 
             performTapAtCurrentButtonCenter("Delayed tap")
             countdownRunning = false
-            mainHandler.post {
-                statusText.text = "Tap fired. systemLatency=${systemLatencyNanos / 1_000_000L}ms"
-            }
+            mainHandler.post { statusText.text = "Tap fired." }
         }
 
         timingHandler.post(runnable)
