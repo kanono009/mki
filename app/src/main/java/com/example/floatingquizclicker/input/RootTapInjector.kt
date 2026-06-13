@@ -105,7 +105,7 @@ class RootTapInjector(private val context: Context) {
      * Strategy 1: Run `getevent -lp` via su and parse for ABS_MT_POSITION_X
      *             + ABS_MT_POSITION_Y — the node reporting both is the touchscreen.
      *
-     * Strategy 2 (fallback): Read /sys/class/input/event*/name and match
+     * Strategy 2 (fallback): Read /sys/class/input/eventN/name and match
      *             known touchscreen name substrings.
      */
     private fun detectTouchNode(): String? {
